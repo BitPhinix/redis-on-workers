@@ -1,6 +1,6 @@
 {
-  "name": "redis-on-workers",
-  "version": "0.3.1",
+  "name": "@bitphinix/redis-on-workers",
+  "version": "0.3.6",
   "description": "Connect to your Redis server using cloudflare:sockets",
   "scripts": {
     "build": "tsup",

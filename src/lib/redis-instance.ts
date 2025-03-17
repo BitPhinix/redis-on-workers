@@ -1,10 +1,11 @@
+import { Buffer } from "node:buffer";
 import type {
   Command,
   ConnectionInstance,
   CreateRedisOptions,
   RedisResponse,
 } from "../type";
-import { createParser } from "./utils/create-parser";
+import { JavascriptRedisParser } from "./utils/create-parser";
 import { encodeCommand } from "./utils/encode-command";
 import { getConnectFn } from "./utils/get-connect-fn";
 import { type WithResolvers, promiseWithResolvers } from "./utils/promise";
@@ -12,7 +13,6 @@ import { stringifyResult } from "./utils/stringify-result";
 
 export class RedisInstance {
   private encoder = new TextEncoder();
-  private decoder = new TextDecoder();
 
   private promiseQueue: WithResolvers<RedisResponse>[] = [];
 
@@ -22,25 +22,17 @@ export class RedisInstance {
 
   private isInitialized = false;
 
-  private parser = createParser({
-    onReply: (reply) => {
-      const logger = this.logger;
-
-      if (logger)
-        logger?.(
-          "Received reply",
-          reply instanceof Uint8Array
-            ? this.decoder.decode(reply)
-            : String(reply),
-        );
-
-      this.promiseQueue.shift()?.resolve(reply);
+  private parser = new JavascriptRedisParser({
+    returnError: (error: Error) => {
+      this.promiseQueue.shift()?.reject(error);
     },
-    onError: (err) => {
-      if (this.logger)
-        this.logger("Error", err.message, err.stack ?? "No stack");
+    returnFatalError: (error: Error) => {
+      this.logger?.("Fatal error", error.message, error.stack ?? "No stack");
 
-      this.promiseQueue.shift()?.reject(err);
+      this.close(error);
+    },
+    returnReply: (result: RedisResponse) => {
+      this.promiseQueue.shift()?.resolve(result);
     },
   });
 
@@ -273,7 +265,8 @@ export class RedisInstance {
       }
 
       if (result.value) {
-        this.parser(result.value);
+        console.log("result.value", result.value);
+        this.parser.execute(Buffer.from(result.value));
       }
 
       if (result.done) {

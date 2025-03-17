@@ -1,119 +1,27 @@
-// source: https://github.com/NodeRedis/node-redis-parser/blob/4c2d31c8717f05dea1ffd91a0e45d68f452c73bd/lib/parser.js#L315
-// 1. replace node-only module "buffer" to "Uint8Array"
-// 2. remove "string_decoder" module, just return Uint8Array
-// 3. replace "redis-errors" with "Error"
+import { Buffer } from "node:buffer";
+import { StringDecoder } from "node:string_decoder";
 
-import { CreateParserOptions } from "../../type";
+const decoder = new StringDecoder();
 
-let bufferPool: Uint8Array | undefined;
-let bufferOffset = 0;
-let interval: NodeJS.Timeout | undefined;
-let counter = 0;
-let notDecreased = 0;
+class ReplyError extends Error {}
+class ParserError extends Error {}
 
-function createParserContext(options: CreateParserOptions) {
-  return {
-    options,
-    offset: 0,
-    buffer: null as Uint8Array | null,
-    bigStrSize: 0,
-    totalChunkSize: 0,
-    bufferCache: [] as Uint8Array[],
-    arrayCache: [] as any[],
-    arrayPos: [] as number[],
-  };
-}
+var bufferPool = Buffer.allocUnsafe(32 * 1024);
+var bufferOffset = 0;
+var interval = null;
+var counter = 0;
+var notDecreased = 0;
 
-type ParserContext = ReturnType<typeof createParserContext>;
-
-function pushArrayCache(parser: ParserContext, array: any[], pos: number) {
-  parser.arrayCache.push(array);
-  parser.arrayPos.push(pos);
-}
-
-function parseLength(parser: ParserContext) {
-  if (!parser.buffer) throw new Error("Buffer is null");
-
+/**
+ * Used for integer numbers only
+ * @param {JavascriptRedisParser} parser
+ * @returns {undefined|number}
+ */
+function parseSimpleNumbers(parser) {
   const length = parser.buffer.length - 1;
-
-  let offset = parser.offset,
-    number = 0;
-
-  while (offset < length) {
-    const c1 = parser.buffer[offset++];
-
-    if (c1 === 13) {
-      parser.offset = offset + 1;
-
-      return number;
-    }
-
-    number = number * 10 + (c1 - 48);
-  }
-}
-
-function parseBulkString(parser: ParserContext) {
-  const length = parseLength(parser);
-
-  if (length === undefined) return;
-
-  if (length < 0) return null;
-
-  const offset = parser.offset + length;
-
-  if (!parser.buffer) throw new Error("Buffer is null");
-
-  if (offset + 2 > parser.buffer.length) {
-    parser.bigStrSize = offset + 2;
-    parser.totalChunkSize = parser.buffer.length;
-    parser.bufferCache.push(parser.buffer);
-    return;
-  }
-
-  const start = parser.offset;
-
-  parser.offset = offset + 2;
-
-  return parser.buffer.slice(start, offset);
-}
-
-function parseSimpleString(parser: ParserContext) {
-  const start = parser.offset;
-  const buffer = parser.buffer;
-
-  if (!buffer) throw new Error("Buffer is null");
-
-  const length = buffer.length - 1;
-  let offset = start;
-
-  while (offset < length) {
-    if (buffer[offset++] === 13) {
-      // \r\n
-      parser.offset = offset + 1;
-
-      return buffer.slice(start, offset - 1);
-    }
-  }
-}
-
-function parseArray(parser: ParserContext) {
-  const length = parseLength(parser);
-  if (length === undefined) return;
-
-  if (length < 0) return null;
-
-  const responses = new Array(length);
-
-  return parseArrayElements(parser, responses, 0);
-}
-
-function parseSimpleNumbers(parser: ParserContext) {
-  if (!parser.buffer) throw new Error("Buffer is null");
-
-  const length = parser.buffer.length - 1;
-  let offset = parser.offset,
-    number = 0,
-    sign = 1;
+  var offset = parser.offset;
+  var number = 0;
+  var sign = 1;
 
   if (parser.buffer[offset] === 45) {
     sign = -1;
@@ -122,33 +30,270 @@ function parseSimpleNumbers(parser: ParserContext) {
 
   while (offset < length) {
     const c1 = parser.buffer[offset++];
-
     if (c1 === 13) {
       // \r\n
       parser.offset = offset + 1;
       return sign * number;
     }
-
     number = number * 10 + (c1 - 48);
   }
 }
 
-function parseError(parser: ParserContext) {
-  return new Error(
-    new TextDecoder().decode(parseSimpleString(parser)) || "Unknown error",
-  );
+/**
+ * Used for integer numbers in case of the returnNumbers option
+ *
+ * Reading the string as parts of n SMI is more efficient than
+ * using a string directly.
+ *
+ * @param {JavascriptRedisParser} parser
+ * @returns {undefined|string}
+ */
+function parseStringNumbers(parser) {
+  const length = parser.buffer.length - 1;
+  var offset = parser.offset;
+  var number = 0;
+  var res = "";
+
+  if (parser.buffer[offset] === 45) {
+    res += "-";
+    offset++;
+  }
+
+  while (offset < length) {
+    var c1 = parser.buffer[offset++];
+    if (c1 === 13) {
+      // \r\n
+      parser.offset = offset + 1;
+      if (number !== 0) {
+        res += number;
+      }
+      return res;
+    } else if (number > 429496728) {
+      res += number * 10 + (c1 - 48);
+      number = 0;
+    } else if (c1 === 48 && number === 0) {
+      res += 0;
+    } else {
+      number = number * 10 + (c1 - 48);
+    }
+  }
 }
 
-function handleError(parser: ParserContext, type: number) {
-  const err = new Error(
-    `Protocol error, got ${JSON.stringify(String.fromCharCode(type))} as reply type byte: ${JSON.stringify(parser.buffer)} at offset ${parser.offset}`,
-  );
+/**
+ * Parse a '+' redis simple string response but forward the offsets
+ * onto convertBufferRange to generate a string.
+ * @param {JavascriptRedisParser} parser
+ * @returns {undefined|string|Buffer}
+ */
+function parseSimpleString(parser) {
+  const start = parser.offset;
+  const buffer = parser.buffer;
+  const length = buffer.length - 1;
+  var offset = start;
 
+  while (offset < length) {
+    if (buffer[offset++] === 13) {
+      // \r\n
+      parser.offset = offset + 1;
+      if (parser.optionReturnBuffers === true) {
+        return parser.buffer.slice(start, offset - 1);
+      }
+      return parser.buffer.toString("utf8", start, offset - 1);
+    }
+  }
+}
+
+/**
+ * Returns the read length
+ * @param {JavascriptRedisParser} parser
+ * @returns {undefined|number}
+ */
+function parseLength(parser) {
+  const length = parser.buffer.length - 1;
+  var offset = parser.offset;
+  var number = 0;
+
+  while (offset < length) {
+    const c1 = parser.buffer[offset++];
+    if (c1 === 13) {
+      parser.offset = offset + 1;
+      return number;
+    }
+    number = number * 10 + (c1 - 48);
+  }
+}
+
+/**
+ * Parse a ':' redis integer response
+ *
+ * If stringNumbers is activated the parser always returns numbers as string
+ * This is important for big numbers (number > Math.pow(2, 53)) as js numbers
+ * are 64bit floating point numbers with reduced precision
+ *
+ * @param {JavascriptRedisParser} parser
+ * @returns {undefined|number|string}
+ */
+function parseInteger(parser) {
+  if (parser.optionStringNumbers === true) {
+    return parseStringNumbers(parser);
+  }
+  return parseSimpleNumbers(parser);
+}
+
+/**
+ * Parse a '$' redis bulk string response
+ * @param {JavascriptRedisParser} parser
+ * @returns {undefined|null|string}
+ */
+function parseBulkString(parser) {
+  const length = parseLength(parser);
+  if (length === undefined) {
+    return;
+  }
+  if (length < 0) {
+    return null;
+  }
+  const offset = parser.offset + length;
+  if (offset + 2 > parser.buffer.length) {
+    parser.bigStrSize = offset + 2;
+    parser.totalChunkSize = parser.buffer.length;
+    parser.bufferCache.push(parser.buffer);
+    return;
+  }
+  const start = parser.offset;
+  parser.offset = offset + 2;
+  if (parser.optionReturnBuffers === true) {
+    return parser.buffer.slice(start, offset);
+  }
+  return parser.buffer.toString("utf8", start, offset);
+}
+
+/**
+ * Parse a '-' redis error response
+ * @param {JavascriptRedisParser} parser
+ * @returns {ReplyError}
+ */
+function parseError(parser) {
+  var string = parseSimpleString(parser);
+  if (string !== undefined) {
+    if (parser.optionReturnBuffers === true) {
+      string = string.toString();
+    }
+    return new ReplyError(string);
+  }
+}
+
+/**
+ * Parsing error handler, resets parser buffer
+ * @param {JavascriptRedisParser} parser
+ * @param {number} type
+ * @returns {undefined}
+ */
+function handleError(parser, type) {
+  const err = new ParserError(
+    "Protocol error, got " +
+      JSON.stringify(String.fromCharCode(type)) +
+      " as reply type byte",
+    JSON.stringify(parser.buffer),
+    parser.offset,
+  );
   parser.buffer = null;
-  parser.options.onError(err);
+  parser.returnFatalError(err);
 }
 
-function parseType(parser: ParserContext, type: number) {
+/**
+ * Parse a '*' redis array response
+ * @param {JavascriptRedisParser} parser
+ * @returns {undefined|null|any[]}
+ */
+function parseArray(parser) {
+  const length = parseLength(parser);
+  if (length === undefined) {
+    return;
+  }
+  if (length < 0) {
+    return null;
+  }
+  const responses = new Array(length);
+  return parseArrayElements(parser, responses, 0);
+}
+
+/**
+ * Push a partly parsed array to the stack
+ *
+ * @param {JavascriptRedisParser} parser
+ * @param {any[]} array
+ * @param {number} pos
+ * @returns {undefined}
+ */
+function pushArrayCache(parser, array, pos) {
+  parser.arrayCache.push(array);
+  parser.arrayPos.push(pos);
+}
+
+/**
+ * Parse chunked redis array response
+ * @param {JavascriptRedisParser} parser
+ * @returns {undefined|any[]}
+ */
+function parseArrayChunks(parser) {
+  var arr = parser.arrayCache.pop();
+  var pos = parser.arrayPos.pop();
+  if (parser.arrayCache.length) {
+    const res = parseArrayChunks(parser);
+    if (res === undefined) {
+      pushArrayCache(parser, arr, pos);
+      return;
+    }
+    arr[pos++] = res;
+  }
+  return parseArrayElements(parser, arr, pos);
+}
+
+/**
+ * Parse redis array response elements
+ * @param {JavascriptRedisParser} parser
+ * @param {Array} responses
+ * @param {number} i
+ * @returns {undefined|null|any[]}
+ */
+function parseArrayElements(parser, responses, i) {
+  const bufferLength = parser.buffer.length;
+  while (i < responses.length) {
+    const offset = parser.offset;
+    if (parser.offset >= bufferLength) {
+      pushArrayCache(parser, responses, i);
+      return;
+    }
+    const response = parseType(parser, parser.buffer[parser.offset++]);
+    if (response === undefined) {
+      if (!(parser.arrayCache.length || parser.bufferCache.length)) {
+        parser.offset = offset;
+      }
+      pushArrayCache(parser, responses, i);
+      return;
+    }
+    responses[i] = response;
+    i++;
+  }
+
+  return responses;
+}
+
+/**
+ * Called the appropriate parser for the specified type.
+ *
+ * 36: $
+ * 43: +
+ * 42: *
+ * 58: :
+ * 45: -
+ *
+ * @param {JavascriptRedisParser} parser
+ * @param {number} type
+ * @returns {*}
+ */
+function parseType(parser, type) {
   switch (type) {
     case 36:
       return parseBulkString(parser);
@@ -157,7 +302,7 @@ function parseType(parser: ParserContext, type: number) {
     case 42:
       return parseArray(parser);
     case 58:
-      return parseSimpleNumbers(parser);
+      return parseInteger(parser);
     case 45:
       return parseError(parser);
     default:
@@ -165,208 +310,252 @@ function parseType(parser: ParserContext, type: number) {
   }
 }
 
-function parseArrayElements(
-  parser: ParserContext,
-  responses: any[],
-  i: number,
-) {
-  if (!parser.buffer) throw new Error("Buffer is null");
-
-  if (!Array.isArray(responses)) throw new Error("Responses is not an array");
-
-  const bufferLength = parser.buffer.length;
-
-  while (i < responses.length) {
-    const offset = parser.offset;
-
-    if (parser.offset >= bufferLength)
-      return pushArrayCache(parser, responses, i);
-
-    const response = parseType(parser, parser.buffer[parser.offset++]);
-
-    if (response === undefined) {
-      if (!(parser.arrayCache.length || parser.bufferCache.length)) {
-        parser.offset = offset;
-      }
-
-      return pushArrayCache(parser, responses, i);
-    }
-
-    responses[i] = response;
-    i++;
-  }
-
-  return responses;
-}
-
-function parseArrayChunks(parser: ParserContext) {
-  const tmp = parser.arrayCache.pop();
-  let pos = parser.arrayPos.pop();
-
-  if (!tmp || pos === undefined) throw new Error("Array cache is empty");
-
-  if (parser.arrayCache.length) {
-    const res = parseArrayChunks(parser);
-
-    if (!res) return pushArrayCache(parser, tmp, pos);
-
-    tmp[pos++] = res;
-  }
-
-  return parseArrayElements(parser, tmp, pos);
-}
-
+/**
+ * Decrease the bufferPool size over time
+ *
+ * Balance between increasing and decreasing the bufferPool.
+ * Decrease the bufferPool by 10% by removing the first 10% of the current pool.
+ * @returns {undefined}
+ */
 function decreaseBufferPool() {
-  if (bufferPool && bufferPool.length > 50 * 1024) {
+  if (bufferPool.length > 50 * 1024) {
     if (counter === 1 || notDecreased > counter * 2) {
       const minSliceLen = Math.floor(bufferPool.length / 10);
       const sliceLength =
         minSliceLen < bufferOffset ? bufferOffset : minSliceLen;
       bufferOffset = 0;
-      bufferPool = bufferPool.subarray(sliceLength, bufferPool.length);
+      bufferPool = bufferPool.slice(sliceLength, bufferPool.length);
     } else {
       notDecreased++;
       counter--;
     }
   } else {
     clearInterval(interval);
-
     counter = 0;
     notDecreased = 0;
-    interval = undefined;
+    interval = null;
   }
 }
 
-function resizeBuffer(length: number) {
-  if (bufferPool && bufferPool.length >= length + bufferOffset) {
-    return;
-  }
-
-  const multiplier = length > 1024 * 1024 * 75 ? 2 : 3;
-
-  if (bufferOffset > 1024 * 1024 * 111) {
-    bufferOffset = 1024 * 1024 * 50;
-  }
-
-  bufferPool = new Uint8Array(length * multiplier + bufferOffset);
-  bufferOffset = 0;
-  counter++;
-
-  if (interval === null) {
-    interval = setInterval(decreaseBufferPool, 50);
+/**
+ * Check if the requested size fits in the current bufferPool.
+ * If it does not, reset and increase the bufferPool accordingly.
+ *
+ * @param {number} length
+ * @returns {undefined}
+ */
+function resizeBuffer(length) {
+  if (bufferPool.length < length + bufferOffset) {
+    const multiplier = length > 1024 * 1024 * 75 ? 2 : 3;
+    if (bufferOffset > 1024 * 1024 * 111) {
+      bufferOffset = 1024 * 1024 * 50;
+    }
+    bufferPool = Buffer.allocUnsafe(length * multiplier + bufferOffset);
+    bufferOffset = 0;
+    counter++;
+    if (interval === null) {
+      interval = setInterval(decreaseBufferPool, 50);
+    }
   }
 }
 
-function concatBulkBuffer(parser: ParserContext) {
+/**
+ * Concat a bulk string containing multiple chunks
+ *
+ * Notes:
+ * 1) The first chunk might contain the whole bulk string including the \r
+ * 2) We are only safe to fully add up elements that are neither the first nor any of the last two elements
+ *
+ * @param {JavascriptRedisParser} parser
+ * @returns {String}
+ */
+function concatBulkString(parser) {
+  const list = parser.bufferCache;
+  const oldOffset = parser.offset;
+  var chunks = list.length;
+  var offset = parser.bigStrSize - parser.totalChunkSize;
+  parser.offset = offset;
+  if (offset <= 2) {
+    if (chunks === 2) {
+      return list[0].toString("utf8", oldOffset, list[0].length + offset - 2);
+    }
+    chunks--;
+    offset = list[list.length - 2].length + offset;
+  }
+  var res = decoder.write(list[0].slice(oldOffset));
+  for (var i = 1; i < chunks - 1; i++) {
+    res += decoder.write(list[i]);
+  }
+  res += decoder.end(list[i].slice(0, offset - 2));
+  return res;
+}
+
+/**
+ * Concat the collected chunks from parser.bufferCache.
+ *
+ * Increases the bufferPool size beforehand if necessary.
+ *
+ * @param {JavascriptRedisParser} parser
+ * @returns {Buffer}
+ */
+function concatBulkBuffer(parser) {
   const list = parser.bufferCache;
   const oldOffset = parser.offset;
   const length = parser.bigStrSize - oldOffset - 2;
-
-  let chunks = list.length;
-  let offset = parser.bigStrSize - parser.totalChunkSize;
-
+  var chunks = list.length;
+  var offset = parser.bigStrSize - parser.totalChunkSize;
   parser.offset = offset;
-
   if (offset <= 2) {
     if (chunks === 2) {
       return list[0].slice(oldOffset, list[0].length + offset - 2);
     }
-
     chunks--;
     offset = list[list.length - 2].length + offset;
   }
-
   resizeBuffer(length);
   const start = bufferOffset;
-
-  if (!bufferPool) throw new Error("Buffer pool is null");
-
-  bufferPool.set(list[0].subarray(oldOffset), start);
-
+  list[0].copy(bufferPool, start, oldOffset, list[0].length);
   bufferOffset += list[0].length - oldOffset;
-
-  for (const chunk of list.slice(1, chunks - 1)) {
-    bufferPool.set(chunk, bufferOffset);
-
-    bufferOffset += chunk.length;
+  for (var i = 1; i < chunks - 1; i++) {
+    list[i].copy(bufferPool, bufferOffset);
+    bufferOffset += list[i].length;
   }
-
-  bufferPool.set(list[chunks - 1].subarray(0, offset - 2), bufferOffset);
+  list[i].copy(bufferPool, bufferOffset, 0, offset - 2);
   bufferOffset += offset - 2;
-
-  return bufferPool.subarray(start, bufferOffset);
+  return bufferPool.slice(start, bufferOffset);
 }
 
-export function createParser(options: CreateParserOptions) {
-  const context = createParserContext(options);
+export class JavascriptRedisParser {
+  /**
+   * Javascript Redis Parser constructor
+   * @param {{returnError: Function, returnReply: Function, returnFatalError?: Function, returnBuffers: boolean, stringNumbers: boolean }} options
+   * @constructor
+   */
+  constructor(options) {
+    if (!options) {
+      throw new TypeError("Options are mandatory.");
+    }
+    if (
+      typeof options.returnError !== "function" ||
+      typeof options.returnReply !== "function"
+    ) {
+      throw new TypeError(
+        "The returnReply and returnError options have to be functions.",
+      );
+    }
+    this.setReturnBuffers(!!options.returnBuffers);
+    this.setStringNumbers(!!options.stringNumbers);
+    this.returnError = options.returnError;
+    this.returnFatalError = options.returnFatalError || options.returnError;
+    this.returnReply = options.returnReply;
+    this.reset();
+  }
 
-  return function execute(buffer: Uint8Array) {
-    if (context.buffer === null) {
-      context.buffer = buffer;
-      context.offset = 0;
-    } else if (context.bigStrSize === 0) {
-      const oldLength = context.buffer.length;
-      const remainingLength = oldLength - context.offset;
+  /**
+   * Reset the parser values to the initial state
+   *
+   * @returns {undefined}
+   */
+  reset() {
+    this.offset = 0;
+    this.buffer = null;
+    this.bigStrSize = 0;
+    this.totalChunkSize = 0;
+    this.bufferCache = [];
+    this.arrayCache = [];
+    this.arrayPos = [];
+  }
 
-      const newBuffer = new Uint8Array(remainingLength + context.buffer.length);
+  /**
+   * Set the returnBuffers option
+   *
+   * @param {boolean} returnBuffers
+   * @returns {undefined}
+   */
+  setReturnBuffers(returnBuffers) {
+    if (typeof returnBuffers !== "boolean") {
+      throw new TypeError("The returnBuffers argument has to be a boolean");
+    }
+    this.optionReturnBuffers = returnBuffers;
+  }
 
-      newBuffer.set(context.buffer.subarray(context.offset, oldLength));
-      newBuffer.set(buffer, remainingLength);
+  /**
+   * Set the stringNumbers option
+   *
+   * @param {boolean} stringNumbers
+   * @returns {undefined}
+   */
+  setStringNumbers(stringNumbers) {
+    if (typeof stringNumbers !== "boolean") {
+      throw new TypeError("The stringNumbers argument has to be a boolean");
+    }
+    this.optionStringNumbers = stringNumbers;
+  }
 
-      context.offset = 0;
-
-      if (context.arrayCache.length) {
-        const arr = parseArrayChunks(context);
-
+  /**
+   * Parse the redis buffer
+   * @param {Buffer} buffer
+   * @returns {undefined}
+   */
+  execute(buffer) {
+    if (this.buffer === null) {
+      this.buffer = buffer;
+      this.offset = 0;
+    } else if (this.bigStrSize === 0) {
+      const oldLength = this.buffer.length;
+      const remainingLength = oldLength - this.offset;
+      const newBuffer = Buffer.allocUnsafe(remainingLength + buffer.length);
+      this.buffer.copy(newBuffer, 0, this.offset, oldLength);
+      buffer.copy(newBuffer, remainingLength, 0, buffer.length);
+      this.buffer = newBuffer;
+      this.offset = 0;
+      if (this.arrayCache.length) {
+        const arr = parseArrayChunks(this);
         if (arr === undefined) {
           return;
         }
-
-        options.onReply(arr);
+        this.returnReply(arr);
       }
-    } else if (context.totalChunkSize + buffer.length >= context.bigStrSize) {
-      context.bufferCache.push(buffer);
-
-      let tmp = concatBulkBuffer(context) as Uint8Array | undefined;
-
-      context.bigStrSize = 0;
-      context.bufferCache = [];
-      context.buffer = buffer;
-
-      if (context.arrayCache.length) {
-        context.arrayCache[0][context.arrayPos[0]++] = tmp;
-        tmp = parseArrayChunks(context) as Uint8Array | undefined;
-
-        if (!tmp) return;
+    } else if (this.totalChunkSize + buffer.length >= this.bigStrSize) {
+      this.bufferCache.push(buffer);
+      var tmp = this.optionReturnBuffers
+        ? concatBulkBuffer(this)
+        : concatBulkString(this);
+      this.bigStrSize = 0;
+      this.bufferCache = [];
+      this.buffer = buffer;
+      if (this.arrayCache.length) {
+        this.arrayCache[0][this.arrayPos[0]++] = tmp;
+        tmp = parseArrayChunks(this);
+        if (tmp === undefined) {
+          return;
+        }
       }
-
-      if (tmp !== undefined) options.onReply(tmp);
+      this.returnReply(tmp);
     } else {
-      context.bufferCache.push(buffer);
-      context.totalChunkSize += buffer.length;
+      this.bufferCache.push(buffer);
+      this.totalChunkSize += buffer.length;
       return;
     }
 
-    while (context.offset < context.buffer.length) {
-      const offset = context.offset;
-      const type = context.buffer[context.offset++];
-      const response = parseType(context, type);
-
+    while (this.offset < this.buffer.length) {
+      const offset = this.offset;
+      const type = this.buffer[this.offset++];
+      const response = parseType(this, type);
       if (response === undefined) {
-        if (!(context.arrayCache.length || context.bufferCache.length)) {
-          context.offset = offset;
+        if (!(this.arrayCache.length || this.bufferCache.length)) {
+          this.offset = offset;
         }
-
         return;
       }
 
-      if (response instanceof Error) {
-        options.onError(response);
+      if (type === 45) {
+        this.returnError(response);
       } else {
-        options.onReply(response);
+        this.returnReply(response);
       }
     }
 
-    context.buffer = null;
-  };
+    this.buffer = null;
+  }
 }
